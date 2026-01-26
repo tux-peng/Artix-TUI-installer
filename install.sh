@@ -94,6 +94,12 @@ setup_artix_repos() {
 
 # -- 5. Menus --
 select_menu_options() {
+    dialog --defaultyes --yesno "Enable AUR support?\n\nRequired for:\n• Extra fonts\n• monitor-control-qt\n\nRecommended." 12 60
+    if [ $? -eq 0 ]; then
+        ENABLE_AUR="yes"
+    else
+        ENABLE_AUR="no"
+     fi
     # Drive
     OPTIONS=()
     while read -r name size model; do
@@ -111,11 +117,20 @@ select_menu_options() {
 
     # Auto Options (FS & Swap)
     SWAP_SIZE_GB="0"
+    ENABLE_SNAPSHOTS="no"
+
     if [ "$METHOD" == "Auto" ]; then
         FS_CHOICE=$(dialog --stdout --menu "Select Root Filesystem" 12 60 3 \
             "Btrfs" "Modern, Copy-on-Write (Snapshot support)" \
             "EXT4" "Standard, reliable, widely supported" \
             "F2FS" "Flash-Friendly (Optimized for SSDs/NVMe)") || exit 1
+            
+        if [ "$FS_CHOICE" = "Btrfs" ]; then
+            dialog --defaultyes --yesno "Enable automatic Btrfs snapshots?\n\nRequires GRUB.\nUses grub-btrfs." 12 60
+            if [ $? -eq 0 ]; then
+                ENABLE_SNAPSHOTS="yes"
+            fi
+        fi
 
         TOTAL_RAM_MB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
         TOTAL_RAM_GB=$(awk -v ram="$TOTAL_RAM_MB" 'BEGIN { printf "%.0f", ram/1024/1024 }')
@@ -160,14 +175,18 @@ select_menu_options() {
         "XDM" "Minimalist, old-school") || exit 1
 
     # Font Selection
-    FONT_CHOICES=$(dialog --stdout --checklist "Select Additional Fonts (Space to select, Enter to confirm)" 18 75 7 \
-        "Monterey" "Fonts extracted from the MacOS Monterey CD" off \
-        "Apple-SF" "Fonts extracted from Apples developer webpage" off \
-        "Cursive" "otf-frb-american-cursive (50+ faces for education)" off \
-        "Annotation" "ttf-annotation-mono-variable (Handwriting style)" off \
-        "MS-Fonts" "ttf-ms-fonts (Times New Roman, Arial)" off \
-        "Adobe-Base" "adobe-base-14-fonts (Helvetica, Courier)" off \
-        "Vista" "ttf-vista-fonts (Calibri, Cambria, Consolas)" off) || FONT_CHOICES=""
+    FONT_CHOICES=""
+    if [ "$ENABLE_AUR" = "yes" ]; then
+        FONT_CHOICES=$(dialog --stdout --checklist "Select Additional Fonts (AUR required)" 18 75 7 \
+            "Monterey" "macOS Monterey fonts" off \
+            "Apple-SF" "Apple San Francisco fonts" off \
+            "Cursive" "FRB American Cursive" off \
+            "Annotation" "Annotation Mono Variable" off \
+            "MS-Fonts" "Microsoft Core Fonts" on \
+            "Adobe-Base" "Adobe Base 14" on \
+            "Vista" "Windows Vista fonts" off) || FONT_CHOICES=""
+    fi
+
 
     # SSH Option
     dialog --defaultno --yesno "Do you want to enable SSH Server (openssh)?" 8 60
@@ -191,6 +210,13 @@ partition_drive() {
         clear
         log "Wiping $DISK..."
         sgdisk -Z "$DISK"
+        
+        # Partition Naming Logic (NVMe/MMC fix)
+        local PART_PREFIX=""
+        if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
+            PART_PREFIX="p"
+        fi
+
         sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
 
         if [ "$SWAP_SIZE_GB" -gt 0 ]; then
@@ -198,21 +224,17 @@ partition_drive() {
             sgdisk -n 2:0:+${SWAP_SIZE_GB}G -t 2:8200 -c 2:"SWAP" "$DISK"
             sgdisk -n 3:0:0                 -t 3:8300 -c 3:"ROOT" "$DISK"
 
-            if [[ "$DISK" == *"nvme"* ]]; then
-                EFI_PART="${DISK}p1"; SWAP_PART="${DISK}p2"; ROOT_PART="${DISK}p3"
-            else
-                EFI_PART="${DISK}1"; SWAP_PART="${DISK}2"; ROOT_PART="${DISK}3"
-            fi
+            EFI_PART="${DISK}${PART_PREFIX}1"
+            SWAP_PART="${DISK}${PART_PREFIX}2"
+            ROOT_PART="${DISK}${PART_PREFIX}3"
+            
             mkswap "$SWAP_PART" && swapon "$SWAP_PART"
         else
             log "No Swap selected."
             sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK"
 
-            if [[ "$DISK" == *"nvme"* ]]; then
-                EFI_PART="${DISK}p1"; ROOT_PART="${DISK}p2"
-            else
-                EFI_PART="${DISK}1"; ROOT_PART="${DISK}2"
-            fi
+            EFI_PART="${DISK}${PART_PREFIX}1"
+            ROOT_PART="${DISK}${PART_PREFIX}2"
         fi
 
         mkfs.vfat -F32 "$EFI_PART"
@@ -289,6 +311,10 @@ install_base() {
 configure_system() {
     local TARGET_UUID="$1"
     local SELECTED_FONTS="$2"
+    
+    # Capture variables for chroot injection
+    local INJECT_FS="$FS_CHOICE"
+    local INJECT_SNAP="$ENABLE_SNAPSHOTS"
 
     HOSTNAME=$(dialog --stdout --inputbox "Enter Hostname:" 10 40 "artixlinux")
     USERNAME=$(dialog --stdout --inputbox "Enter Username:" 10 40 "user")
@@ -306,6 +332,10 @@ configure_system() {
 #!/bin/bash
 set -e
 exec < /dev/tty
+
+# Variables injected from host
+FS_CHOICE="$INJECT_FS"
+ENABLE_SNAPSHOTS="$INJECT_SNAP"
 
 # --- Function: Enable Service ---
 enable_service() {
@@ -331,21 +361,22 @@ echo "$HOSTNAME" > /etc/hostname
 echo "127.0.0.1 localhost" >> /etc/hosts
 echo "127.0.1.1 $HOSTNAME.localdomain $HOSTNAME" >> /etc/hosts
 
-enable_service NetworkManager
-
 # Enable SSH
 if [ "$ENABLE_SSH" == "yes" ]; then
     echo "Enabling SSH..."
-    SSH_PKG="openssh"
+    pacman -S --noconfirm openssh
+    SSH_PKG=""
     case "$INIT_SYS" in
         "openrc") SSH_PKG="openssh-openrc" ;;
         "runit")  SSH_PKG="openssh-runit" ;;
         "dinit")  SSH_PKG="openssh-dinit" ;;
         "s6")     SSH_PKG="openssh-s6" ;;
     esac
-    pacman -S --noconfirm openssh \$SSH_PKG
+    pacman -S --noconfirm \$SSH_PKG
     enable_service sshd
 fi
+
+enable_service NetworkManager
 
 # Repos
 pacman-key --init
@@ -482,13 +513,26 @@ fi
 
 case "$BOOTLOADER" in
     "GRUB")
-        pacman -S --noconfirm grub efibootmgr
+        pacman -S --noconfirm grub efibootmgr os-prober
         grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+        
+        # Check injected variable, NOT the host variable
+        if [ "$ENABLE_SNAPSHOTS" = "yes" ]; then
+            pacman -S --noconfirm grub-btrfs inotify-tools
+            # Attempt to enable grub-btrfsd
+            case "$INIT_SYS" in
+                 "openrc") rc-update add grub-btrfs default ;;
+                 "runit")  ln -s /etc/runit/sv/grub-btrfs /etc/runit/runsvdir/default ;;
+                 "dinit")  dinitctl enable grub-btrfs ;;
+                 # s6 support varies for this pkg
+            esac
+        fi
         grub-mkconfig -o /boot/grub/grub.cfg
         ;;
     "rEFInd")
         pacman -S --noconfirm refind
         refind-install
+        # FIXED: Added 'rw' to kernel parameters
         echo "\"Boot with standard options\"  \"root=UUID=$TARGET_UUID \$ROOT_FLAGS initrd=/initramfs-linux.img\"" > /boot/refind_linux.conf
         echo "\"Boot to fallback initramfs\"  \"root=UUID=$TARGET_UUID \$ROOT_FLAGS initrd=/initramfs-linux-fallback.img\"" >> /boot/refind_linux.conf
         ;;
@@ -533,7 +577,7 @@ select_menu_options
 partition_drive
 install_base
 setup_artix_repos "$MOUNT_POINT"
-configure_system "$ROOT_UUID" "$FONT_CHOICES"
+configure_system "$ROOT_UUID" "$FONT_CHOICES" "$ENABLE_AUR" "$ENABLE_SNAPSHOTS"
 
 # -- FINAL SUCCESS MESSAGE --
 FINAL_MSG="Artix Installation Complete! Rebooting..."

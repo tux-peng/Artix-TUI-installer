@@ -18,7 +18,7 @@ An interactive, TUI-based Bash script designed to automate the installation of *
 
 * **Artix Linux Live ISO**  
 * **Active Internet Connection** (for package downloading)  
-* **UEFI System** (Legacy BIOS support is experimental)
+* **UEFI System** (Legacy BIOS support is untested)
 
 ## ---
 
@@ -27,6 +27,8 @@ An interactive, TUI-based Bash script designed to automate the installation of *
 1. **Boot into the Artix Live environment.**  
 2. **Download the script:**  
    Bash  
+   curl \-O https://raw.githubusercontent.com/tux-peng/Artix-TUI-installer/refs/heads/main/install.sh
+   *** OR LAST STABLE TAG***_
    curl -O https://raw.githubusercontent.com/tux-peng/Artix-TUI-installer/v1.0/install.sh
 
 3. **Make it executable:**  
