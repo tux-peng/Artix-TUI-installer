@@ -24,7 +24,19 @@ LOG="/tmp/installer.log"
 log() { echo -e "${GREEN}[*] $1${NC}" | tee -a "$LOG"; }
 err() { echo -e "${RED}[!] $1${NC}" | tee -a "$LOG"; exit 1; }
 
-# -- 1. Auto-Detect Init System --
+# -- 1. UEFI Check (Strict) --
+check_uefi() {
+    if [ ! -d "/sys/firmware/efi" ]; then
+        echo -e "${RED}[CRITICAL ERROR] Legacy BIOS Detected.${NC}"
+        echo "This installer strictly requires a UEFI environment."
+        echo "Please reboot your computer and disable 'CSM' or 'Legacy Boot' in your BIOS settings."
+        exit 1
+    else
+        log "UEFI Detected. Proceeding..."
+    fi
+}
+
+# -- 2. Auto-Detect Init System --
 detect_init() {
     if command -v rc-update &>/dev/null; then
         INIT_SYS="openrc"
@@ -40,7 +52,7 @@ detect_init() {
     log "Detected Init System: $INIT_SYS"
 }
 
-# -- 2. Disclaimer Warning --
+# -- 3. Disclaimer Warning --
 show_disclaimer() {
     if ! command -v dialog &>/dev/null; then
         pacman -Sy --noconfirm dialog &>/dev/null
@@ -52,11 +64,11 @@ WARNING: The AI wrote 80% of this script.\n\n\
 TESTING STATUS:\n\
 Only SonicDE on OpenRC with SDDM using GRUB & rEFInd have been explicitly tested.\n\n\
 Additionally, only Auto-Partitioning and UEFI Systems have been tested.\n\n\
-Other combinations (Runit/s6/Dinit, other DEs, Manual Partitioning, BIOS/CSM) are experimental.\n\n\
+Other combinations (Runit/s6/Dinit, other DEs, Manual Partitioning) are experimental.\n\n\
 Press OK to proceed at your own risk." 18 60
 }
 
-# -- 3. Pre-Flight Checks --
+# -- 4. Pre-Flight Checks --
 pre_flight() {
     clear
     log "Checking environment..."
@@ -69,7 +81,7 @@ pre_flight() {
     pacman -S --noconfirm dialog git || err "Failed to install dependencies."
 }
 
-# -- 4. Configure Artix Repos --
+# -- 5. Configure Artix Repos --
 setup_artix_repos() {
     local TARGET_ROOT="$1"
     local CONF_PATH="${TARGET_ROOT}/etc/pacman.conf"
@@ -92,9 +104,9 @@ setup_artix_repos() {
     if [ -z "$TARGET_ROOT" ]; then pacman -Sy; fi
 }
 
-# -- 5. Menus --
+# -- 6. Menus --
 select_menu_options() {
-    dialog --defaultyes --yesno "Enable AUR support?\n\nRequired for:\n• Extra fonts\n• monitor-control-qt\n\nRecommended." 12 60
+    dialog --defaultyes --yesno "Enable AUR support (via aurutils)?\n\nRequired for:\n• Extra fonts\n• monitor-control-qt\n\nRecommended." 12 60
     if [ $? -eq 0 ]; then
         ENABLE_AUR="yes"
     else
@@ -124,7 +136,7 @@ select_menu_options() {
             "Btrfs" "Modern, Copy-on-Write (Snapshot support)" \
             "EXT4" "Standard, reliable, widely supported" \
             "F2FS" "Flash-Friendly (Optimized for SSDs/NVMe)") || exit 1
-            
+
         if [ "$FS_CHOICE" = "Btrfs" ]; then
             dialog --defaultyes --yesno "Enable automatic Btrfs snapshots?\n\nRequires GRUB.\nUses grub-btrfs." 12 60
             if [ $? -eq 0 ]; then
@@ -203,14 +215,14 @@ select_menu_options() {
     TIMEZONE="${REGION}/${CITY}"
 }
 
-# -- 6. Partitioning --
+# -- 7. Partitioning --
 partition_drive() {
     if [ "$METHOD" == "Auto" ]; then
         dialog --defaultno --yesno "WARNING: ALL DATA ON $DISK WILL BE ERASED. PROCEED?" 10 60 || exit 1
         clear
         log "Wiping $DISK..."
         sgdisk -Z "$DISK"
-        
+
         # Partition Naming Logic (NVMe/MMC fix)
         local PART_PREFIX=""
         if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
@@ -227,7 +239,7 @@ partition_drive() {
             EFI_PART="${DISK}${PART_PREFIX}1"
             SWAP_PART="${DISK}${PART_PREFIX}2"
             ROOT_PART="${DISK}${PART_PREFIX}3"
-            
+
             mkswap "$SWAP_PART" && swapon "$SWAP_PART"
         else
             log "No Swap selected."
@@ -284,7 +296,7 @@ partition_drive() {
     fi
 }
 
-# -- 7. Base Install (Init-Aware) --
+# -- 8. Base Install (Init-Aware) --
 install_base() {
     clear
     log "Installing Artix Base System ($INIT_SYS)..."
@@ -307,14 +319,15 @@ install_base() {
     if [ ! -f "$MOUNT_POINT/bin/bash" ]; then err "Base install failed. /mnt/bin/bash not found."; fi
 }
 
-# -- 8. Configure Target --
+# -- 9. Configure Target --
 configure_system() {
     local TARGET_UUID="$1"
     local SELECTED_FONTS="$2"
-    
-    # Capture variables for chroot injection
+    local ENABLE_AUR="$3"
+    local ENABLE_SNAPSHOTS="$4"
+
+    # Capture FS choice for chroot injection (local var is not avail inside chroot)
     local INJECT_FS="$FS_CHOICE"
-    local INJECT_SNAP="$ENABLE_SNAPSHOTS"
 
     HOSTNAME=$(dialog --stdout --inputbox "Enter Hostname:" 10 40 "artixlinux")
     USERNAME=$(dialog --stdout --inputbox "Enter Username:" 10 40 "user")
@@ -335,7 +348,8 @@ exec < /dev/tty
 
 # Variables injected from host
 FS_CHOICE="$INJECT_FS"
-ENABLE_SNAPSHOTS="$INJECT_SNAP"
+ENABLE_AUR="$ENABLE_AUR"
+ENABLE_SNAPSHOTS="$ENABLE_SNAPSHOTS"
 
 # --- Function: Enable Service ---
 enable_service() {
@@ -347,6 +361,25 @@ enable_service() {
         "dinit")  dinitctl enable "\$SERVICE" ;;
         "s6")     if command -v s6-rc-bundle-update &>/dev/null; then s6-rc-bundle-update add default "\$SERVICE"; fi ;;
     esac
+}
+
+# --- Function: Build AUR Package (aurutils) ---
+build_aur() {
+    PKG="\$1"
+    echo "Building AUR package: \$PKG..."
+
+    # Allow temp sudo
+    echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/00_temp_installer
+
+    # 1. Sync/Build to local repo
+    # Note: 'aur sync' handles downloading, building, and adding to the repo db
+    su - "$USERNAME" -c "aur sync --no-view --noconfirm \$PKG"
+
+    # 2. Install from local repo using pacman
+    pacman -S --noconfirm \$PKG
+
+    # Cleanup
+    rm /etc/sudoers.d/00_temp_installer
 }
 # ------------------------------
 
@@ -391,6 +424,30 @@ echo "root:$PASSWORD" | chpasswd
 useradd -m -G wheel -s /bin/bash "$USERNAME" || true
 echo "$USERNAME:$PASSWORD" | chpasswd
 
+# Setup aurutils if AUR enabled
+if [ "\$ENABLE_AUR" == "yes" ]; then
+    echo "Setting up aurutils..."
+    pacman -S --noconfirm aurutils
+
+    # Create local repo dir
+    mkdir -p /home/custompkgs
+    chown -R "$USERNAME:$USERNAME" /home/custompkgs
+
+    # Initialize repo db
+    su - "$USERNAME" -c "repo-add /home/custompkgs/custom.db.tar.gz"
+
+    # Add to pacman.conf
+    if ! grep -q "^\[custom\]" /etc/pacman.conf; then
+        cat <<PAC >> /etc/pacman.conf
+
+[custom]
+SigLevel = Optional TrustAll
+Server = file:///home/custompkgs
+PAC
+    fi
+    pacman -Sy
+fi
+
 # Install Desktop
 echo "Installing Desktop: $DE_CHOICE"
 case "$DE_CHOICE" in
@@ -416,18 +473,10 @@ case "$DE_CHOICE" in
         fi
 
         # --- Install monitor-control-qt (AUR) for SonicDE ---
-        echo "Installing monitor-control-qt (AUR)..."
-        # Ensure yaourtix is installed
-        pacman -S --noconfirm yaourtix
-
-        # Allow temp sudo without password
-        echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/00_temp_installer
-
-        # Build as user
-        su - "$USERNAME" -c "yaourtix -S --noconfirm monitor-control-qt"
-
-        # Cleanup
-        rm /etc/sudoers.d/00_temp_installer
+        if [ "\$ENABLE_AUR" == "yes" ]; then
+            echo "Installing monitor-control-qt (AUR)..."
+            build_aur "monitor-control-qt"
+        fi
         ;;
     "KDE")     pacman -S --noconfirm plasma kde-applications konsole ;;
     "Moksha")  pacman -S --noconfirm moksha-artix terminology ;;
@@ -442,44 +491,33 @@ case "$DE_CHOICE" in
     *) pacman -S --noconfirm pamac-gtk || pacman -S --noconfirm pamac-all || echo "Warning: Pamac not found." ;;
 esac
 
-# Install Fonts (Yaourtix)
+# Install Fonts (AUR)
 TARGET_FONTS='$SELECTED_FONTS'
 
-if [ -n "\$TARGET_FONTS" ]; then
+if [ "\$ENABLE_AUR" == "yes" ] && [ -n "\$TARGET_FONTS" ]; then
     echo "Installing Selected Fonts..."
-    pacman -S --noconfirm yaourtix
-    echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/00_temp_installer
 
     if [[ "\$TARGET_FONTS" == *"Monterey"* ]]; then
-        echo "Building Monterey Fonts..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm ttf-monterey-fonts-en"
+        build_aur "ttf-monterey-fonts-en"
     fi
     if [[ "\$TARGET_FONTS" == *"Apple-SF"* ]]; then
-        echo "Building Apple SF Fonts..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm apple-sf-fonts"
+        build_aur "apple-sf-fonts"
     fi
     if [[ "\$TARGET_FONTS" == *"Cursive"* ]]; then
-        echo "Building FRB American Cursive..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm otf-frb-american-cursive"
+        build_aur "otf-frb-american-cursive"
     fi
     if [[ "\$TARGET_FONTS" == *"Annotation"* ]]; then
-        echo "Building Annotation Mono..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm ttf-annotation-mono-variable"
+        build_aur "ttf-annotation-mono-variable"
     fi
     if [[ "\$TARGET_FONTS" == *"MS-Fonts"* ]]; then
-        echo "Building MS Fonts..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm ttf-ms-fonts"
+        build_aur "ttf-ms-fonts"
     fi
     if [[ "\$TARGET_FONTS" == *"Adobe-Base"* ]]; then
-        echo "Building Adobe Base 14 Fonts..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm adobe-base-14-fonts"
+        build_aur "adobe-base-14-fonts"
     fi
     if [[ "\$TARGET_FONTS" == *"Vista"* ]]; then
-        echo "Building Vista Fonts..."
-        su - "$USERNAME" -c "yaourtix -S --noconfirm ttf-vista-fonts"
+        build_aur "ttf-vista-fonts"
     fi
-
-    rm /etc/sudoers.d/00_temp_installer
 fi
 
 # Restore Sudo
@@ -515,7 +553,7 @@ case "$BOOTLOADER" in
     "GRUB")
         pacman -S --noconfirm grub efibootmgr os-prober
         grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
-        
+
         # Check injected variable, NOT the host variable
         if [ "$ENABLE_SNAPSHOTS" = "yes" ]; then
             pacman -S --noconfirm grub-btrfs inotify-tools
@@ -569,6 +607,7 @@ EOF
 }
 
 # -- Main Execution --
+check_uefi
 detect_init
 show_disclaimer
 pre_flight
