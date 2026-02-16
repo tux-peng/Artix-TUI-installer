@@ -1,8 +1,8 @@
 #!/bin/bash
 
 # ==============================================================================
-#  SonicDE Artix Installer (Universal Init Edition)
-#  Features: Auto-Detects Init, Multi-DE, Custom KDE Apps, Smart Pkg Mgr, Fonts
+#   SonicDE Artix Installer (Universal Init + BIOS/UEFI Support)
+#   Features: Auto-Detects Init, Multi-DE, Custom KDE Apps, Smart Pkg Mgr, Fonts
 # ==============================================================================
 
 # -- 0. Root Check --
@@ -24,20 +24,20 @@ LOG="/tmp/installer.log"
 log() { echo -e "${GREEN}[*] $1${NC}" | tee -a "$LOG"; }
 err() { echo -e "${RED}[!] $1${NC}" | tee -a "$LOG"; exit 1; }
 
-# -- 1. UEFI Check (Strict) --
-check_uefi() {
-    if [ ! -d "/sys/firmware/efi" ]; then
-        echo -e "${RED}[CRITICAL ERROR] Legacy BIOS Detected.${NC}"
-        echo "This installer strictly requires a UEFI environment."
-        echo "Please reboot your computer and disable 'CSM' or 'Legacy Boot' in your BIOS settings."
-        exit 1
-    else
+# -- 1. Boot Mode Check (Updated for BIOS) --
+check_boot_mode() {
+    if [ -d "/sys/firmware/efi" ]; then
+        BOOT_MODE="UEFI"
         log "UEFI Detected. Proceeding..."
+    else
+        BOOT_MODE="BIOS"
+        log "Legacy BIOS Detected. Enabling CSM Support."
     fi
 }
 
 # -- 2. Auto-Detect Init System --
 detect_init() {
+    log "Detecting init system..."
     if command -v rc-update &>/dev/null; then
         INIT_SYS="openrc"
     elif command -v runit &>/dev/null; then
@@ -58,60 +58,56 @@ show_disclaimer() {
         pacman -Sy --noconfirm dialog &>/dev/null
     fi
 
+    local S6_WARN=""
+    if [ "$INIT_SYS" == "s6" ]; then
+        S6_WARN="\n\n⚠️ S6 WARNING: s6 support in this installer is highly experimental."
+    fi
+
     dialog --title "⚠️ EXPERIMENTAL INSTALLER ⚠️" \
-           --msgbox "\nDetected Init System: $INIT_SYS\n\n\
-WARNING: The AI wrote 80% of this script.\n\n\
+           --msgbox "\nDetected Init System: $INIT_SYS\n\
+Boot Mode: $BOOT_MODE\n\n\
+WARNING: AI assisted in writing this script.$S6_WARN\n\n\
 TESTING STATUS:\n\
-Only SonicDE on OpenRC with SDDM using GRUB & rEFInd have been explicitly tested.\n\n\
-Additionally, only Auto-Partitioning and UEFI Systems have been tested.\n\n\
-Other combinations (Runit/s6/Dinit, other DEs, Manual Partitioning) are experimental.\n\n\
+Only SonicDE & LXQT on OpenRC with SDDM using GRUB have been explicitly tested.\n\
+Both BIOS and UEFI modes are supported.\n\n\
 Press OK to proceed at your own risk." 18 60
 }
 
-# -- 4. Pre-Flight Checks --
+# -- 4. Pre-Flight Checks (Host Side) --
 pre_flight() {
     clear
-    log "Checking environment..."
+    log "Checking environment (Host)..."
     if ! ping -c 1 google.com &>/dev/null; then
         err "No internet connection. Please connect manually."
     fi
+    log "Internet working."
 
-    log "Updating Artix Keyring..."
+    # --- MIRROR RANKING START ---
+    log "Optimizing Host Mirrors..."
+    # FIX: Corrected syntax error from original script
+    if ! command -v rankmirrors &>/dev/null; then
+        pacman -Sy --noconfirm --needed pacman-contrib
+    fi
+
+    if [ -f /etc/pacman.d/mirrorlist ]; then
+        cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
+        log "Ranking top 5 mirrors..."
+        rankmirrors -n 5 /etc/pacman.d/mirrorlist.backup > /etc/pacman.d/mirrorlist
+    fi
+    # --- MIRROR RANKING END ---
+
+    log "Updating Host Keyring..."
     pacman -Sy --noconfirm artix-keyring
-    pacman -S --noconfirm dialog git || err "Failed to install dependencies."
+    pacman -S --noconfirm --needed dialog git || err "Failed to install dependencies."
 }
 
-# -- 5. Configure Artix Repos --
-setup_artix_repos() {
-    local TARGET_ROOT="$1"
-    local CONF_PATH="${TARGET_ROOT}/etc/pacman.conf"
-
-    log "Configuring Artix Repositories on ${TARGET_ROOT:-Live System}..."
-
-    if ! grep -q "^\[galaxy\]" "$CONF_PATH"; then
-        sed -i '/#\[galaxy\]/s/^#//g' "$CONF_PATH" 2>/dev/null
-        sed -i '/\[galaxy\]/{n;s/^#//}' "$CONF_PATH" 2>/dev/null
-        if ! grep -q "^\[galaxy\]" "$CONF_PATH"; then
-            echo -e "\n[galaxy]\nInclude = /etc/pacman.d/mirrorlist" >> "$CONF_PATH"
-        fi
-    fi
-
-    if ! grep -q "^\[lib32\]" "$CONF_PATH"; then
-        sed -i '/#\[lib32\]/s/^#//g' "$CONF_PATH" 2>/dev/null
-        sed -i '/\[lib32\]/{n;s/^#//}' "$CONF_PATH" 2>/dev/null
-    fi
-
-    if [ -z "$TARGET_ROOT" ]; then pacman -Sy; fi
-}
-
-# -- 6. Menus --
+# -- 5. Menus --
 select_menu_options() {
-    dialog --defaultyes --yesno "Enable AUR support (via aurutils)?\n\nRequired for:\n• Extra fonts\n• monitor-control-qt\n\nRecommended." 12 60
-    if [ $? -eq 0 ]; then
-        ENABLE_AUR="yes"
-    else
-        ENABLE_AUR="no"
-     fi
+    clear
+    sleep 1
+    dialog --yesno "Enable AUR support (via aurutils)?\n\nRequired for:\n• Extra fonts\n• monitor-control-qt\n\nRecommended." 12 60
+    if [ $? -eq 0 ]; then ENABLE_AUR="yes"; else ENABLE_AUR="no"; fi
+
     # Drive
     OPTIONS=()
     while read -r name size model; do
@@ -138,10 +134,8 @@ select_menu_options() {
             "F2FS" "Flash-Friendly (Optimized for SSDs/NVMe)") || exit 1
 
         if [ "$FS_CHOICE" = "Btrfs" ]; then
-            dialog --defaultyes --yesno "Enable automatic Btrfs snapshots?\n\nRequires GRUB.\nUses grub-btrfs." 12 60
-            if [ $? -eq 0 ]; then
-                ENABLE_SNAPSHOTS="yes"
-            fi
+            dialog --yesno "Enable automatic Btrfs snapshots?\n\nRequires GRUB.\nUses grub-btrfs." 12 60
+            if [ $? -eq 0 ]; then ENABLE_SNAPSHOTS="yes"; fi
         fi
 
         TOTAL_RAM_MB=$(grep MemTotal /proc/meminfo | awk '{print $2}')
@@ -166,12 +160,17 @@ select_menu_options() {
     fi
 
     # Bootloader
-    BOOTLOADER=$(dialog --stdout --menu "Select Bootloader" 13 60 3 \
-        "GRUB" "Standard, reliable" \
-        "rEFInd" "Graphical, auto-detects" \
-        "Limine" "Modern, simple config (PROBABLY BROKEN)") || exit 1
+    if [ "$BOOT_MODE" == "BIOS" ]; then
+        BOOTLOADER="GRUB"
+        dialog --msgbox "Legacy BIOS detected.\n\nBootloader locked to GRUB.\nrEFInd and Limine require UEFI." 10 60
+    else
+        BOOTLOADER=$(dialog --stdout --menu "Select Bootloader" 13 60 3 \
+            "GRUB" "Standard, reliable" \
+            "rEFInd" "Graphical, auto-detects" \
+            "Limine" "Modern, simple config (PROBABLY BROKEN)") || exit 1
+    fi
 
-    # Desktop Environment Selection
+    # Desktop Environment
     DE_CHOICE=$(dialog --stdout --menu "Select Desktop Environment" 16 60 6 \
         "SonicDE" "Plasma Desktop (XLibre Fixes) (Meta Package)" \
         "KDE" "Plasma Desktop (Modern, Customizable)" \
@@ -180,7 +179,7 @@ select_menu_options() {
         "XFCE4" "Lightweight, Stable, Classic" \
         "LXQt" "Extremely Lightweight (Qt-based)") || exit 1
 
-    # Display Manager Selection
+    # Display Manager
     DM_CHOICE=$(dialog --stdout --menu "Select Display Manager" 13 60 3 \
         "SDDM" "Modern, Qt-based (Recommended for KDE/Sonic/LXQt)" \
         "LightDM" "Lightweight, GTK-based (Recommended for XFCE/MATE)" \
@@ -199,7 +198,6 @@ select_menu_options() {
             "Vista" "Windows Vista fonts" off) || FONT_CHOICES=""
     fi
 
-
     # SSH Option
     dialog --defaultno --yesno "Do you want to enable SSH Server (openssh)?" 8 60
     if [ $? -eq 0 ]; then ENABLE_SSH="yes"; else ENABLE_SSH="no"; fi
@@ -215,7 +213,7 @@ select_menu_options() {
     TIMEZONE="${REGION}/${CITY}"
 }
 
-# -- 7. Partitioning --
+# -- 6. Partitioning (Updated for BIOS/UEFI) --
 partition_drive() {
     if [ "$METHOD" == "Auto" ]; then
         dialog --defaultno --yesno "WARNING: ALL DATA ON $DISK WILL BE ERASED. PROCEED?" 10 60 || exit 1
@@ -223,33 +221,35 @@ partition_drive() {
         log "Wiping $DISK..."
         sgdisk -Z "$DISK"
 
-        # Partition Naming Logic (NVMe/MMC fix)
         local PART_PREFIX=""
         if [[ "$DISK" == *"nvme"* ]] || [[ "$DISK" == *"mmcblk"* ]]; then
             PART_PREFIX="p"
         fi
 
-        sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
+        # -- BOOT PARTITION LOGIC --
+        if [ "$BOOT_MODE" == "UEFI" ]; then
+            log "Creating EFI Partition..."
+            sgdisk -n 1:0:+512M -t 1:ef00 -c 1:"EFI" "$DISK"
+            EFI_PART="${DISK}${PART_PREFIX}1"
+            mkfs.vfat -F32 "$EFI_PART"
+        else
+            log "Creating BIOS Boot Partition (GPT)..."
+            sgdisk -n 1:0:+8M -t 1:ef02 -c 1:"BIOSBOOT" "$DISK"
+        fi
 
+        # Swap & Root
         if [ "$SWAP_SIZE_GB" -gt 0 ]; then
             log "Creating ${SWAP_SIZE_GB}GB Swap..."
             sgdisk -n 2:0:+${SWAP_SIZE_GB}G -t 2:8200 -c 2:"SWAP" "$DISK"
             sgdisk -n 3:0:0                 -t 3:8300 -c 3:"ROOT" "$DISK"
-
-            EFI_PART="${DISK}${PART_PREFIX}1"
             SWAP_PART="${DISK}${PART_PREFIX}2"
             ROOT_PART="${DISK}${PART_PREFIX}3"
-
             mkswap "$SWAP_PART" && swapon "$SWAP_PART"
         else
             log "No Swap selected."
             sgdisk -n 2:0:0 -t 2:8300 -c 2:"ROOT" "$DISK"
-
-            EFI_PART="${DISK}${PART_PREFIX}1"
             ROOT_PART="${DISK}${PART_PREFIX}2"
         fi
-
-        mkfs.vfat -F32 "$EFI_PART"
 
         log "Formatting Root as $FS_CHOICE..."
         case "$FS_CHOICE" in
@@ -282,13 +282,15 @@ partition_drive() {
             mkdir -p "$MOUNT_POINT"/boot
         fi
 
-        mount "$EFI_PART" "$MOUNT_POINT/boot"
+        if [ "$BOOT_MODE" == "UEFI" ]; then
+             mount "$EFI_PART" "$MOUNT_POINT/boot"
+        fi
 
     else
         clear
         log "Launching cfdisk..."
         cfdisk "$DISK"
-        dialog --msgbox "Partitioning complete.\n\nPlease manually mount partitions to /mnt now.\n(Alt+F2 to open terminal)\n\nIMPORTANT: When done, you must identify your ROOT partition so we can get the UUID." 12 60
+        dialog --msgbox "Partitioning complete.\n\nPlease manually mount partitions to /mnt now.\n(Alt+F2 to open terminal)\n\nIMPORTANT: If using BIOS/GPT, ensure you created a 'BIOS Boot' partition.\n\nWhen done, you must identify your ROOT partition so we can get the UUID." 12 60
         ROOT_PART=$(dialog --stdout --inputbox "Enter Root Partition (e.g. /dev/sda3):" 10 60) || exit 1
         ROOT_UUID=$(blkid -s UUID -o value "$ROOT_PART")
         if [ -z "$ROOT_UUID" ]; then err "Could not determine UUID. Exiting."; fi
@@ -296,7 +298,7 @@ partition_drive() {
     fi
 }
 
-# -- 8. Base Install (Init-Aware) --
+# -- 7. Base Install (Init-Aware) --
 install_base() {
     clear
     log "Installing Artix Base System ($INIT_SYS)..."
@@ -312,6 +314,7 @@ install_base() {
     if [ "$FS_CHOICE" == "Btrfs" ]; then FS_TOOLS="btrfs-progs"; fi
     if [ "$FS_CHOICE" == "F2FS" ]; then FS_TOOLS="f2fs-tools"; fi
 
+    # basestrap installs to /mnt.
     basestrap "$MOUNT_POINT" base base-devel elogind linux linux-firmware \
                              networkmanager nano git dialog $FS_TOOLS $PACKAGES || err "Basestrap failed."
 
@@ -319,14 +322,14 @@ install_base() {
     if [ ! -f "$MOUNT_POINT/bin/bash" ]; then err "Base install failed. /mnt/bin/bash not found."; fi
 }
 
-# -- 9. Configure Target --
+# -- 8. Configure Target (Passed BOOT_MODE and DISK) --
 configure_system() {
     local TARGET_UUID="$1"
     local SELECTED_FONTS="$2"
     local ENABLE_AUR="$3"
     local ENABLE_SNAPSHOTS="$4"
+    local TARGET_DISK="$DISK"  # Raw disk for BIOS GRUB install
 
-    # Capture FS choice for chroot injection (local var is not avail inside chroot)
     local INJECT_FS="$FS_CHOICE"
 
     HOSTNAME=$(dialog --stdout --inputbox "Enter Hostname:" 10 40 "artixlinux")
@@ -339,8 +342,10 @@ configure_system() {
         if [ "$PASS1" == "$PASS2" ]; then PASSWORD="$PASS1"; break; else dialog --msgbox "Passwords do not match." 10 40; fi
     done
 
+    # Copy network config to ensure chroot has internet
     cp /etc/resolv.conf "$MOUNT_POINT/etc/resolv.conf"
 
+    # --- GENERATE CHROOT SCRIPT ---
     cat <<EOF > "$MOUNT_POINT/setup_internal.sh"
 #!/bin/bash
 set -e
@@ -350,6 +355,8 @@ exec < /dev/tty
 FS_CHOICE="$INJECT_FS"
 ENABLE_AUR="$ENABLE_AUR"
 ENABLE_SNAPSHOTS="$ENABLE_SNAPSHOTS"
+BOOT_MODE="$BOOT_MODE"
+TARGET_DISK="$TARGET_DISK"
 
 # --- Function: Enable Service ---
 enable_service() {
@@ -367,23 +374,38 @@ enable_service() {
 build_aur() {
     PKG="\$1"
     echo "Building AUR package: \$PKG..."
-
-    # Allow temp sudo
     echo "%wheel ALL=(ALL:ALL) NOPASSWD: ALL" > /etc/sudoers.d/00_temp_installer
-
-    # 1. Sync/Build to local repo
-    # Note: 'aur sync' handles downloading, building, and adding to the repo db
     su - "$USERNAME" -c "aur sync --no-view --noconfirm \$PKG"
-
-    # 2. Install from local repo using pacman
     pacman -S --noconfirm \$PKG
-
-    # Cleanup
     rm /etc/sudoers.d/00_temp_installer
 }
-# ------------------------------
 
 echo "Starting Artix Configuration ($INIT_SYS)..."
+
+# --- INTERNAL PRE-FLIGHT (Chroot) ---
+# AUDIT: Run network/mirror checks INSIDE chroot to ensure installed system is clean.
+echo "Running Internal Pre-Flight..."
+if ! ping -c 1 google.com &>/dev/null; then
+    echo "Warning: No internet in Chroot. Check /etc/resolv.conf"
+fi
+
+echo "Updating Chroot Keyrings..."
+pacman -Sy --noconfirm artix-keyring
+
+echo "Optimizing Mirrors (Chroot)..."
+if ! command -v rankmirrors &>/dev/null; then
+    # Install pacman-contrib inside chroot for rankmirrors
+    pacman -S --noconfirm pacman-contrib
+fi
+
+if [ -f /etc/pacman.d/mirrorlist ]; then
+    cp /etc/pacman.d/mirrorlist /etc/pacman.d/mirrorlist.backup
+    rankmirrors -n 5 /etc/pacman.d/mirrorlist.backup > /etc/pacman.d/mirrorlist
+    echo "Mirrors updated."
+fi
+pacman -Sy
+# ------------------------------------
+
 ln -sf /usr/share/zoneinfo/$TIMEZONE /etc/localtime
 hwclock --systohc
 echo "en_US.UTF-8 UTF-8" > /etc/locale.gen
@@ -428,15 +450,9 @@ echo "$USERNAME:$PASSWORD" | chpasswd
 if [ "\$ENABLE_AUR" == "yes" ]; then
     echo "Setting up aurutils..."
     pacman -S --noconfirm aurutils
-
-    # Create local repo dir
     mkdir -p /home/custompkgs
     chown -R "$USERNAME:$USERNAME" /home/custompkgs
-
-    # Initialize repo db
     su - "$USERNAME" -c "repo-add /home/custompkgs/custom.db.tar.gz"
-
-    # Add to pacman.conf
     if ! grep -q "^\[custom\]" /etc/pacman.conf; then
         cat <<PAC >> /etc/pacman.conf
 
@@ -455,8 +471,8 @@ case "$DE_CHOICE" in
         echo "Installing SonicDE base + Konsole..."
         pacman -S --noconfirm sonicde-meta konsole || echo "Warning: SonicDE-Meta not found."
 
-        # --- SonicDE KDE Applications Selection ---
-        KDE_APPS_CHOICE=\$(dialog --stdout --checklist "Select KDE Application Groups to install:" 18 60 8 \\
+        # KDE Groups
+        KDE_APPS_CHOICE=\$(dialog --stdout --checklist "Select KDE Application Groups:" 18 60 8 \\
             "kde-applications" "Full KDE Suite (Heavy)" off \\
             "kde-graphics" "Graphics (Gwenview, Spectacle)" off \\
             "kde-multimedia" "Multimedia (Elisa, Kdenlive)" off \\
@@ -468,17 +484,31 @@ case "$DE_CHOICE" in
 
         if [ -n "\$KDE_APPS_CHOICE" ]; then
             KDE_APPS_LIST=\$(echo \$KDE_APPS_CHOICE | tr -d '"')
-            echo "Installing selected KDE groups: \$KDE_APPS_LIST"
             pacman -S --noconfirm \$KDE_APPS_LIST
         fi
 
-        # --- Install monitor-control-qt (AUR) for SonicDE ---
         if [ "\$ENABLE_AUR" == "yes" ]; then
-            echo "Installing monitor-control-qt (AUR)..."
             build_aur "monitor-control-qt"
         fi
         ;;
-    "KDE")     pacman -S --noconfirm plasma kde-applications konsole ;;
+
+    "KDE")
+        pacman -S --noconfirm plasma konsole
+        KDE_APPS_CHOICE=\$(dialog --stdout --checklist "Select KDE Application Groups:" 18 60 8 \\
+            "kde-applications" "Full KDE Suite (Heavy)" off \\
+            "kde-graphics" "Graphics" off \\
+            "kde-multimedia" "Multimedia" off \\
+            "kde-network" "Network" off \\
+            "kde-office" "Office" off \\
+            "kde-pim" "PIM" off \\
+            "kde-system" "System Tools" off \\
+            "kde-utilities" "Utilities" off)
+        if [ -n "\$KDE_APPS_CHOICE" ]; then
+            KDE_APPS_LIST=\$(echo \$KDE_APPS_CHOICE | tr -d '"')
+            pacman -S --noconfirm \$KDE_APPS_LIST
+        fi
+        ;;
+
     "Moksha")  pacman -S --noconfirm moksha-artix terminology ;;
     "MATE")    pacman -S --noconfirm mate mate-extra system-config-printer blueman connman-gtk mate-terminal ;;
     "XFCE4")   pacman -S --noconfirm xfce4 xfce4-goodies xfce4-terminal ;;
@@ -496,28 +526,13 @@ TARGET_FONTS='$SELECTED_FONTS'
 
 if [ "\$ENABLE_AUR" == "yes" ] && [ -n "\$TARGET_FONTS" ]; then
     echo "Installing Selected Fonts..."
-
-    if [[ "\$TARGET_FONTS" == *"Monterey"* ]]; then
-        build_aur "ttf-monterey-fonts-en"
-    fi
-    if [[ "\$TARGET_FONTS" == *"Apple-SF"* ]]; then
-        build_aur "apple-sf-fonts"
-    fi
-    if [[ "\$TARGET_FONTS" == *"Cursive"* ]]; then
-        build_aur "otf-frb-american-cursive"
-    fi
-    if [[ "\$TARGET_FONTS" == *"Annotation"* ]]; then
-        build_aur "ttf-annotation-mono-variable"
-    fi
-    if [[ "\$TARGET_FONTS" == *"MS-Fonts"* ]]; then
-        build_aur "ttf-ms-fonts"
-    fi
-    if [[ "\$TARGET_FONTS" == *"Adobe-Base"* ]]; then
-        build_aur "adobe-base-14-fonts"
-    fi
-    if [[ "\$TARGET_FONTS" == *"Vista"* ]]; then
-        build_aur "ttf-vista-fonts"
-    fi
+    if [[ "\$TARGET_FONTS" == *"Monterey"* ]]; then build_aur "ttf-monterey-fonts-en"; fi
+    if [[ "\$TARGET_FONTS" == *"Apple-SF"* ]]; then build_aur "apple-sf-fonts"; fi
+    if [[ "\$TARGET_FONTS" == *"Cursive"* ]]; then build_aur "otf-frb-american-cursive"; fi
+    if [[ "\$TARGET_FONTS" == *"Annotation"* ]]; then build_aur "ttf-annotation-mono-variable"; fi
+    if [[ "\$TARGET_FONTS" == *"MS-Fonts"* ]]; then build_aur "ttf-ms-fonts"; fi
+    if [[ "\$TARGET_FONTS" == *"Adobe-Base"* ]]; then build_aur "adobe-base-14-fonts"; fi
+    if [[ "\$TARGET_FONTS" == *"Vista"* ]]; then build_aur "ttf-vista-fonts"; fi
 fi
 
 # Restore Sudo
@@ -551,18 +566,24 @@ fi
 
 case "$BOOTLOADER" in
     "GRUB")
-        pacman -S --noconfirm grub efibootmgr os-prober
-        grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+        pacman -S --noconfirm grub os-prober
 
-        # Check injected variable, NOT the host variable
+        if [ "\$BOOT_MODE" == "UEFI" ]; then
+            echo "Installing GRUB for UEFI..."
+            pacman -S --noconfirm efibootmgr
+            grub-install --target=x86_64-efi --efi-directory=/boot --bootloader-id=GRUB
+        else
+            echo "Installing GRUB for BIOS (Legacy)..."
+            # Note: TARGET_DISK is injected at top of this script
+            grub-install --target=i386-pc "\$TARGET_DISK"
+        fi
+
         if [ "$ENABLE_SNAPSHOTS" = "yes" ]; then
             pacman -S --noconfirm grub-btrfs inotify-tools
-            # Attempt to enable grub-btrfsd
             case "$INIT_SYS" in
                  "openrc") rc-update add grub-btrfs default ;;
                  "runit")  ln -s /etc/runit/sv/grub-btrfs /etc/runit/runsvdir/default ;;
                  "dinit")  dinitctl enable grub-btrfs ;;
-                 # s6 support varies for this pkg
             esac
         fi
         grub-mkconfig -o /boot/grub/grub.cfg
@@ -570,7 +591,6 @@ case "$BOOTLOADER" in
     "rEFInd")
         pacman -S --noconfirm refind
         refind-install
-        # FIXED: Added 'rw' to kernel parameters
         echo "\"Boot with standard options\"  \"root=UUID=$TARGET_UUID \$ROOT_FLAGS initrd=/initramfs-linux.img\"" > /boot/refind_linux.conf
         echo "\"Boot to fallback initramfs\"  \"root=UUID=$TARGET_UUID \$ROOT_FLAGS initrd=/initramfs-linux-fallback.img\"" >> /boot/refind_linux.conf
         ;;
@@ -607,15 +627,13 @@ EOF
 }
 
 # -- Main Execution --
-check_uefi
+check_boot_mode
 detect_init
-show_disclaimer
 pre_flight
-setup_artix_repos ""
+show_disclaimer
 select_menu_options
 partition_drive
 install_base
-setup_artix_repos "$MOUNT_POINT"
 configure_system "$ROOT_UUID" "$FONT_CHOICES" "$ENABLE_AUR" "$ENABLE_SNAPSHOTS"
 
 # -- FINAL SUCCESS MESSAGE --
