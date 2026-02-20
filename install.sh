@@ -365,7 +365,7 @@ enable_service() {
     case "$INIT_SYS" in
         "openrc") rc-update add "\$SERVICE" default ;;
         "runit")  ln -s /etc/runit/sv/"\$SERVICE" /etc/runit/runsvdir/default ;;
-        "dinit")  dinitctl enable "\$SERVICE" ;;
+        "dinit")  ln -sf /etc/dinit.d/"\$SERVICE" /etc/dinit.d/boot.d/ ;;
         "s6")     if command -v s6-rc-bundle-update &>/dev/null; then s6-rc-bundle-update add default "\$SERVICE"; fi ;;
     esac
 }
@@ -578,12 +578,19 @@ case "$BOOTLOADER" in
             grub-install --target=i386-pc "\$TARGET_DISK"
         fi
 
-        if [ "$ENABLE_SNAPSHOTS" = "yes" ]; then
-            pacman -S --noconfirm grub-btrfs inotify-tools
+if [ "$ENABLE_SNAPSHOTS" = "yes" ]; then
+            pacman -S --noconfirm grub-btrfs inotify-tools snapper snap-pac # <-- ADDED SNAPPER
+
+            # Setup initial Snapper config for root
+            umount /.snapshots
+            rm -r /.snapshots
+            snapper -c root create-config /
+            mount -a # Remounts /.snapshots from fstab using the proper subvolume
+
             case "$INIT_SYS" in
-                 "openrc") rc-update add grub-btrfs default ;;
-                 "runit")  ln -s /etc/runit/sv/grub-btrfs /etc/runit/runsvdir/default ;;
-                 "dinit")  dinitctl enable grub-btrfs ;;
+                 "openrc") rc-update add grub-btrfsd default ;;
+                 "runit")  ln -sf /etc/runit/sv/grub-btrfsd /etc/runit/runsvdir/default/ ;;
+                 "dinit")  ln -sf /etc/dinit.d/grub-btrfsd /etc/dinit.d/boot.d/ ;; # <-- NOTE 'd' at the end of grub-btrfsd
             esac
         fi
         grub-mkconfig -o /boot/grub/grub.cfg
